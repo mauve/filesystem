@@ -116,6 +116,10 @@ using std::wstring;
 #     include <sys/utime.h>
 #   endif
 
+#   if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_APP)
+#     include <windows.storage.h>
+#   endif
+
 //  REPARSE_DATA_BUFFER related definitions are found in ntifs.h, which is part of the 
 //  Windows Device Driver Kit. Since that's inconvenient, the definitions are provided
 //  here. See http://msdn.microsoft.com/en-us/library/ms791514.aspx
@@ -172,6 +176,7 @@ typedef struct _REPARSE_DATA_BUFFER {
 #   define IO_REPARSE_TAG_SYMLINK (0xA000000CL)       
 # endif
 
+# if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP)
 inline std::wstring wgetenv(const wchar_t* name)
 {
   // use vector since for C++03 basic_string is not required to be contiguous
@@ -182,6 +187,7 @@ inline std::wstring wgetenv(const wchar_t* name)
     || ::GetEnvironmentVariableW(name, &buf[0], static_cast<DWORD>(buf.size())) == 0)
     ? std::wstring() : std::wstring(&buf[0]);
 }
+# endif
 
 # endif  // BOOST_WINDOWS_API
 
@@ -237,7 +243,14 @@ typedef DWORD err_t;
 #   define BOOST_CREATE_SYMBOLIC_LINK(F,T,Flag)(create_symbolic_link_api(F, T, Flag)!= 0)
 #   define BOOST_REMOVE_DIRECTORY(P)(::RemoveDirectoryW(P)!= 0)
 #   define BOOST_DELETE_FILE(P)(::DeleteFileW(P)!= 0)
+#  if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP)
 #   define BOOST_COPY_DIRECTORY(F,T)(::CreateDirectoryExW(F, T, 0)!= 0)
+#  else
+   // CreateDirectoryEx is not supported in store apps, therefore
+   // we just use CreateDirectory, this will ignore any attributes
+   // which needs fixing obviously
+#   define BOOST_COPY_DIRECTORY(F,T)(::CreateDirectoryW(T, 0)!= 0)
+#  endif
 #   define BOOST_COPY_FILE(F,T,FailIfExistsBool)(::CopyFileW(F, T, FailIfExistsBool)!= 0)
 #   define BOOST_MOVE_FILE(OLD,NEW)(::MoveFileExW(OLD, NEW, MOVEFILE_REPLACE_EXISTING|MOVEFILE_COPY_ALLOWED)!= 0)
 #   define BOOST_RESIZE_FILE(P,SZ)(resize_file_api(P, SZ)!= 0)
@@ -573,21 +586,57 @@ namespace
     }
   };
 
-  HANDLE create_file_handle(const path& p, DWORD dwDesiredAccess,
+  HANDLE create_file_handle(const wchar_t* p, DWORD dwDesiredAccess,
     DWORD dwShareMode, LPSECURITY_ATTRIBUTES lpSecurityAttributes,
-    DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes,
+    DWORD dwCreationDisposition, DWORD dwFlags, DWORD dwFileAttributes,
     HANDLE hTemplateFile)
   {
-    return ::CreateFileW(p.c_str(), dwDesiredAccess, dwShareMode,
-      lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes,
+#   if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP)
+    return ::CreateFileW(p, dwDesiredAccess, dwShareMode,
+      lpSecurityAttributes, dwCreationDisposition, dwFlags | dwAttributes,
+      hTemplateFile);
+#   else
+    CREATEFILE2_EXTENDED_PARAMETERS cep;
+    cep.dwSize = sizeof(cep);
+    cep.dwFileAttributes = dwFileAttributes;
+    cep.dwFileFlags = dwFlags;
+    cep.dwSecurityQosFlags = 0;
+    cep.hTemplateFile = NULL;
+    cep.lpSecurityAttributes = NULL;
+    return CreateFile2(p, dwDesiredAccess, dwShareMode, dwCreationDisposition, &cep);
+#   endif
+  }
+
+  HANDLE create_file_handle(const path& p, DWORD dwDesiredAccess,
+    DWORD dwShareMode, LPSECURITY_ATTRIBUTES lpSecurityAttributes,
+    DWORD dwCreationDisposition, DWORD dwFlags, DWORD dwFileAttributes,
+    HANDLE hTemplateFile)
+  {
+    return create_file_handle(p.c_str(), dwDesiredAccess, dwShareMode,
+      lpSecurityAttributes, dwCreationDisposition, dwFlags, dwFileAttributes,
       hTemplateFile);
   }
 
+  DWORD get_file_attributes(const wchar_t* p)
+  {
+#   if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP)
+    return ::GetFileAttributesW(p);
+#   else
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (!::GetFileAttributesExW(p, ::GetFileExInfoStandard, &fad))
+    {
+      return 0xffffffff;
+    }
+    return fad.dwFileAttributes;
+#   endif
+  }
+
+#   if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP)
   bool is_reparse_point_a_symlink(const path& p)
   {
     handle_wrapper h(create_file_handle(p, FILE_READ_EA,
       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
-      FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL));
+      FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, 0, NULL));
     if (h.handle == INVALID_HANDLE_VALUE)
       return false;
 
@@ -611,6 +660,7 @@ namespace
       || reinterpret_cast<const REPARSE_DATA_BUFFER*>(buf.get())->ReparseTag
         == IO_REPARSE_TAG_MOUNT_POINT;  // aka "directory junction" or "junction"
   }
+#   endif
 
   inline std::size_t get_full_path_name(
     const path& src, std::size_t len, wchar_t* buf, wchar_t** p)
@@ -643,7 +693,7 @@ namespace
   //  _detail_directory_symlink, as required on Windows by remove() and its helpers.
   fs::file_type query_file_type(const path& p, error_code* ec)
   {
-    DWORD attr(::GetFileAttributesW(p.c_str()));
+    DWORD attr(get_file_attributes(p.c_str()));
     if (attr == 0xFFFFFFFF)
     {
       return process_status_failure(p, ec).type();
@@ -651,6 +701,7 @@ namespace
 
     if (ec != 0) ec->clear();
 
+#   if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP)
     if (attr & FILE_ATTRIBUTE_REPARSE_POINT)
     {
       if (is_reparse_point_a_symlink(p))
@@ -659,6 +710,7 @@ namespace
           : fs::symlink_file;
       return fs::reparse_file;
     }
+#   endif
 
     return (attr & FILE_ATTRIBUTE_DIRECTORY)
       ? fs::directory_file
@@ -667,8 +719,8 @@ namespace
 
   BOOL resize_file_api(const wchar_t* p, boost::uintmax_t size)
   {
-    handle_wrapper h(CreateFileW(p, GENERIC_WRITE, 0, 0, OPEN_EXISTING,
-                                FILE_ATTRIBUTE_NORMAL, 0));
+    handle_wrapper h(create_file_handle(p, GENERIC_WRITE, 0, 0, OPEN_EXISTING,
+                                        0, FILE_ATTRIBUTE_NORMAL, 0));
     LARGE_INTEGER sz;
     sz.QuadPart = size;
     return h.handle != INVALID_HANDLE_VALUE
@@ -676,6 +728,7 @@ namespace
       && ::SetEndOfFile(h.handle);
   }
 
+# if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP)
   //  Windows kernel32.dll functions that may or may not be present
   //  must be accessed through pointers
 
@@ -698,6 +751,7 @@ namespace
   PtrCreateSymbolicLinkW create_symbolic_link_api = PtrCreateSymbolicLinkW(
     ::GetProcAddress(
       ::GetModuleHandle(TEXT("kernel32.dll")), "CreateSymbolicLinkW"));
+# endif
 
 #endif
 
@@ -913,9 +967,20 @@ namespace detail
   BOOST_FILESYSTEM_DECL
   void copy_file(const path& from, const path& to, copy_option option, error_code* ec)
   {
+#   if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_APP)
+    COPYFILE2_EXTENDED_PARAMETERS cep;
+    cep.dwSize = sizeof(COPYFILE2_EXTENDED_PARAMETERS);
+    cep.dwCopyFlags = option == fail_if_exists ? COPY_FILE_FAIL_IF_EXISTS : 0;
+    cep.pfCancel = NULL;
+    cep.pProgressRoutine = NULL;
+    cep.pvCallbackContext = NULL;
+
+    CopyFile2(from.c_str(), to.c_str(), &cep);
+#   else
     error(!BOOST_COPY_FILE(from.c_str(), to.c_str(),
       option == fail_if_exists) ? BOOST_ERRNO : 0,
         from, to, ec, "boost::filesystem::copy_file");
+#   endif
   }
 
   BOOST_FILESYSTEM_DECL
@@ -1013,7 +1078,8 @@ namespace detail
   void create_directory_symlink(const path& to, const path& from,
                                  system::error_code* ec)
   {
-#   if defined(BOOST_WINDOWS_API) && _WIN32_WINNT < 0x0600  // SDK earlier than Vista and Server 2008
+#   if defined(BOOST_WINDOWS_API) && (_WIN32_WINNT < 0x0600 || WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_APP))
+    // SDK earlier than Vista and Server 2008 or universal
 
     error(BOOST_ERROR_NOT_SUPPORTED, to, from, ec,
       "boost::filesystem::create_directory_symlink");
@@ -1036,7 +1102,8 @@ namespace detail
   void create_hard_link(const path& to, const path& from, error_code* ec)
   {
 
-#   if defined(BOOST_WINDOWS_API) && _WIN32_WINNT < 0x0500  // SDK earlier than Win 2K
+#   if defined(BOOST_WINDOWS_API) && (_WIN32_WINNT < 0x0500 || WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_APP))
+    // SDK earlier than Win 2K or universal
 
     error(BOOST_ERROR_NOT_SUPPORTED, to, from, ec,
       "boost::filesystem::create_hard_link");
@@ -1057,7 +1124,8 @@ namespace detail
   BOOST_FILESYSTEM_DECL
   void create_symlink(const path& to, const path& from, error_code* ec)
   {
-#   if defined(BOOST_WINDOWS_API) && _WIN32_WINNT < 0x0600  // SDK earlier than Vista and Server 2008
+#   if defined(BOOST_WINDOWS_API) && (_WIN32_WINNT < 0x0600 || WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_APP))
+    // SDK earlier than Vista and Server 2008
     error(BOOST_ERROR_NOT_SUPPORTED, to, from, ec,
       "boost::filesystem::create_directory_symlink");
 #   else
@@ -1163,6 +1231,7 @@ namespace detail
           0,
           OPEN_EXISTING,
           FILE_FLAG_BACKUP_SEMANTICS,
+          0,
           0));
 
     handle_wrapper h1(
@@ -1173,6 +1242,7 @@ namespace detail
           0,
           OPEN_EXISTING,
           FILE_FLAG_BACKUP_SEMANTICS,
+          0,
           0));
 
     if (h1.handle == INVALID_HANDLE_VALUE
@@ -1187,6 +1257,24 @@ namespace detail
     }
 
     // at this point, both handles are known to be valid
+
+#    if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_APP)
+
+    FILE_ID_INFO info1, info2;
+
+    if (error(!::GetFileInformationByHandleEx(h1.handle, ::FileIdInfo, &info1, sizeof(info1)) ? BOOST_ERRNO : 0,
+      p1, p2, ec, "boost::filesystem::equivalent"))
+        return false;
+
+    if (error(!::GetFileInformationByHandleEx(h2.handle, ::FileIdInfo, &info2, sizeof(info2)) ? BOOST_ERRNO : 0,
+      p1, p2, ec, "boost::filesystem::equivalent"))
+        return false;
+
+    return
+      info1.VolumeSerialNumber == info2.VolumeSerialNumber
+      && !std::memcmp(info1.FileId.Identifier, info2.FileId.Identifier, 16);
+
+#    else
 
     BY_HANDLE_FILE_INFORMATION info1, info2;
 
@@ -1211,7 +1299,7 @@ namespace detail
           == info2.ftLastWriteTime.dwLowDateTime
         && info1.ftLastWriteTime.dwHighDateTime
           == info2.ftLastWriteTime.dwHighDateTime;
-
+#    endif
 #   endif
   }
 
@@ -1261,13 +1349,17 @@ namespace detail
            : static_cast<boost::uintmax_t>(path_stat.st_nlink);
 
 #   else // Windows
+#    if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_APP)
 
+    return 0;
+
+#    else
     // Link count info is only available through GetFileInformationByHandle
     BY_HANDLE_FILE_INFORMATION info;
     handle_wrapper h(
       create_file_handle(p.c_str(), 0,
           FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE, 0,
-          OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, 0));
+          OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, 0, 0));
     return
       !error(h.handle == INVALID_HANDLE_VALUE ? BOOST_ERRNO : 0,
               p, ec, "boost::filesystem::hard_link_count")
@@ -1275,6 +1367,7 @@ namespace detail
                  p, ec, "boost::filesystem::hard_link_count")
            ? info.nNumberOfLinks
            : 0;
+#    endif
 #   endif
   }
 
@@ -1331,7 +1424,7 @@ namespace detail
     handle_wrapper hw(
       create_file_handle(p.c_str(), 0,
         FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE, 0,
-        OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, 0));
+        OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, 0, 0));
 
     if (error(hw.handle == INVALID_HANDLE_VALUE ? BOOST_ERRNO : 0,
       p, ec, "boost::filesystem::last_write_time"))
@@ -1368,7 +1461,7 @@ namespace detail
     handle_wrapper hw(
       create_file_handle(p.c_str(), FILE_WRITE_ATTRIBUTES,
         FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE, 0,
-        OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, 0));
+        OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, 0, 0));
 
     if (error(hw.handle == INVALID_HANDLE_VALUE ? BOOST_ERRNO : 0,
       p, ec, "boost::filesystem::last_write_time"))
@@ -1455,7 +1548,7 @@ namespace detail
       || (prms & (owner_write|group_write|others_write))))
       return;
 
-    DWORD attr = ::GetFileAttributesW(p.c_str());
+    DWORD attr = get_file_attributes(p.c_str());
 
     if (error(attr == 0 ? BOOST_ERRNO : 0, p, ec, "boost::filesystem::permissions"))
       return;
@@ -1507,6 +1600,11 @@ namespace detail
 #   elif _WIN32_WINNT < 0x0600  // SDK earlier than Vista and Server 2008
     error(BOOST_ERROR_NOT_SUPPORTED, p, ec,
           "boost::filesystem::read_symlink");
+
+#   elif WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_APP)
+    error(BOOST_ERROR_NOT_SUPPORTED, p, ec,
+          "boost::filesystem::read_symlink");
+
 #   else  // Vista and Server 2008 SDK, or later
 
     union info_t
@@ -1517,7 +1615,7 @@ namespace detail
 
     handle_wrapper h(
       create_file_handle(p.c_str(), GENERIC_READ, 0, 0, OPEN_EXISTING,
-        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, 0));
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, 0, 0));
 
     if (error(h.handle == INVALID_HANDLE_VALUE ? BOOST_ERRNO : 0,
       p, ec, "boost::filesystem::read_symlink"))
@@ -1682,12 +1780,13 @@ namespace detail
 
 #   else  // Windows
 
-    DWORD attr(::GetFileAttributesW(p.c_str()));
+    DWORD attr(get_file_attributes(p.c_str()));
     if (attr == 0xFFFFFFFF)
     {
       return process_status_failure(p, ec);
     }
 
+#   if !WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_APP)
     //  reparse point handling;
     //    since GetFileAttributesW does not resolve symlinks, try to open a file
     //    handle to discover if the file exists
@@ -1701,6 +1800,7 @@ namespace detail
             0,  // lpSecurityAttributes
             OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS,
+            0,
             0)); // hTemplateFile
       if (h.handle == INVALID_HANDLE_VALUE)
       {
@@ -1710,6 +1810,7 @@ namespace detail
       if (!is_reparse_point_a_symlink(p))
         return file_status(reparse_file, make_permissions(p, attr));
     }
+#   endif
 
     if (ec != 0) ec->clear();
     return (attr & FILE_ATTRIBUTE_DIRECTORY)
@@ -1765,7 +1866,7 @@ namespace detail
 
 #   else  // Windows
 
-    DWORD attr(::GetFileAttributesW(p.c_str()));
+    DWORD attr(get_file_attributes(p.c_str()));
     if (attr == 0xFFFFFFFF)
     {
       return process_status_failure(p, ec);
@@ -1773,10 +1874,12 @@ namespace detail
 
     if (ec != 0) ec->clear();
 
+#   if !WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_APP)
     if (attr & FILE_ATTRIBUTE_REPARSE_POINT)
       return is_reparse_point_a_symlink(p)
              ? file_status(symlink_file, make_permissions(p, attr))
              : file_status(reparse_file, make_permissions(p, attr));
+#   endif
 
     return (attr & FILE_ATTRIBUTE_DIRECTORY)
       ? file_status(directory_file, make_permissions(p, attr))
@@ -1812,6 +1915,16 @@ namespace detail
         
       return p;
       
+#   elif WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_APP)
+
+    // CANNOT GET THIS TO BUILD:
+    //    libs\filesystem\src\unique_path.cpp: fatal error C1107: could not find assembly 'platform.winmd':
+    //    please specify the assembly search path using /AI or by setting the LIBPATH environment variable
+    // auto temp_folder = Windows::Storage::ApplicationData::Current->TemporaryFolder;
+    // return path{ temp_folder->Path->Begin() };
+
+    return path{};
+
 #   else  // Windows
 
       const wchar_t* tmp_env = L"TMP";
@@ -2131,7 +2244,7 @@ namespace
         && dirpath[dirpath.size()-1] != L':'))? L"\\*" : L"*";
 
     WIN32_FIND_DATAW data;
-    if ((handle = ::FindFirstFileW(dirpath.c_str(), &data))
+    if ((handle = ::FindFirstFileExW(dirpath.c_str(), FindExInfoBasic, &data, FindExSearchNameMatch, NULL, 0))
       == INVALID_HANDLE_VALUE)
     { 
       handle = 0;  // signal eof
